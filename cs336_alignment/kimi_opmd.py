@@ -64,6 +64,8 @@ def compute_kimi_opmd_loss(
     pg_loss = pg_per_sequence.mean()
     pg_magnitude = pg_per_sequence.abs().mean()
     mirror_loss = mirror_per_sequence.mean()
+    pg_force_abs_mean = detached_advantages.abs().mean()
+    mirror_force_abs_mean = (tau * seq_log_ratio).abs().mean()
 
     diagnostics = {
         "kimi/pg_loss": pg_loss.detach(),
@@ -74,6 +76,11 @@ def compute_kimi_opmd_loss(
         ).detach(),
         "kimi/mirror_to_pg_magnitude_ratio": (
             mirror_loss / (pg_magnitude + 1e-12)
+        ).detach(),
+        "kimi/pg_force_abs_mean": pg_force_abs_mean.detach(),
+        "kimi/mirror_force_abs_mean": mirror_force_abs_mean.detach(),
+        "kimi/mirror_to_pg_force_ratio": (
+            mirror_force_abs_mean / (pg_force_abs_mean + 1e-12)
         ).detach(),
         "kimi/seq_log_ratio_mean": seq_log_ratio.mean().detach(),
         "kimi/seq_log_ratio_abs_mean": seq_log_ratio.abs().mean().detach(),

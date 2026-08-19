@@ -451,6 +451,22 @@ def run_kimi_outer_update(
                         float(value.cpu()) * microbatch_weight
                     )
 
+            # Ratios must be formed after aggregating their numerators and
+            # denominators. Averaging per-microbatch ratios is unstable when a
+            # small microbatch has a near-zero mean policy-gradient term.
+            diagnostic_totals["kimi/mirror_to_abs_pg_loss_ratio"] = (
+                diagnostic_totals["kimi/mirror_loss"]
+                / (abs(diagnostic_totals["kimi/pg_loss"]) + 1e-12)
+            )
+            diagnostic_totals["kimi/mirror_to_pg_magnitude_ratio"] = (
+                diagnostic_totals["kimi/mirror_loss"]
+                / (diagnostic_totals["kimi/pg_loss_abs_mean"] + 1e-12)
+            )
+            diagnostic_totals["kimi/mirror_to_pg_force_ratio"] = (
+                diagnostic_totals["kimi/mirror_force_abs_mean"]
+                / (diagnostic_totals["kimi/pg_force_abs_mean"] + 1e-12)
+            )
+
             if not torch.isfinite(total_loss):
                 raise FloatingPointError("Kimi loss became non-finite.")
             grad_norm = torch.nn.utils.clip_grad_norm_(

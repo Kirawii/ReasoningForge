@@ -97,3 +97,29 @@ def test_sequence_log_probability_uses_sum_not_token_mean():
 
     torch.testing.assert_close(loss, torch.tensor(-1.5))
     torch.testing.assert_close(diagnostics["kimi/policy_seq_logp_mean"], torch.tensor(1.5))
+
+
+def test_force_diagnostics_compare_sequence_gradient_terms():
+    policy = torch.tensor([[2.0], [-1.0]], requires_grad=True)
+    reference = torch.zeros_like(policy)
+    mask = torch.ones_like(policy, dtype=torch.bool)
+    advantages = torch.tensor([3.0, -1.0])
+
+    _, diagnostics = compute_kimi_opmd_loss(
+        policy,
+        reference,
+        mask,
+        advantages,
+        tau=0.2,
+    )
+
+    # E|A| = 2; E|tau*d| = (0.4 + 0.2) / 2 = 0.3.
+    torch.testing.assert_close(diagnostics["kimi/pg_force_abs_mean"], torch.tensor(2.0))
+    torch.testing.assert_close(
+        diagnostics["kimi/mirror_force_abs_mean"],
+        torch.tensor(0.3),
+    )
+    torch.testing.assert_close(
+        diagnostics["kimi/mirror_to_pg_force_ratio"],
+        torch.tensor(0.15),
+    )
