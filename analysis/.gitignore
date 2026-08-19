@@ -1,4 +1,5 @@
 .vendor/
+autodl-backup/
 reasoningforge-analysis.tgz
 experiments/**/run_config.json
 experiments/kimi-opmd-tau-summary.json
