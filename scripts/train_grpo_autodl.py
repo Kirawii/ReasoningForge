@@ -6,9 +6,9 @@ AutoDL/local deployment adaptation:
   * logical cuda:1 owns the vLLM rollout server;
   * policy weights are synchronized to vLLM through the existing NCCL path.
 
-The runner intentionally performs one optimizer update per freshly generated
-rollout batch. This keeps the default path on-policy and avoids silently using
-stale rollout log-probabilities.
+The existing GRPO-family path performs one optimizer update per freshly
+generated rollout batch. The independent ``kimi_opmd`` path instead freezes one
+outer-loop batch and reference policy for explicitly configured inner updates.
 """
 
 from __future__ import annotations
@@ -38,8 +38,17 @@ import torch  # noqa: E402
 
 from cs336_alignment.checkpoint import get_model_and_tokenizer  # noqa: E402
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn  # noqa: E402
+from cs336_alignment.kimi_opmd import (  # noqa: E402
+    compute_group_mean_advantages,
+    compute_kimi_opmd_loss,
+)
 from cs336_alignment.vllm_utils import VLLMServer  # noqa: E402
-from tests.adapters import run_grpo_train_step  # noqa: E402
+from tests.adapters import (  # noqa: E402
+    run_compute_rollout_rewards,
+    run_get_response_log_probs,
+    run_grpo_train_step,
+    run_tokenize_prompt_and_output,
+)
 
 
 ALGORITHM_SETTINGS: dict[str, dict[str, Any]] = {
@@ -68,6 +77,11 @@ ALGORITHM_SETTINGS: dict[str, dict[str, Any]] = {
         "advantage_normalizer": "none",
         "loss_normalization": "constant",
     },
+    "kimi_opmd": {
+        "baseline": "mean",
+        "advantage_normalizer": "none",
+        "loss_normalization": "sequence",
+    },
 }
 
 
@@ -84,7 +98,13 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-data", default="data/gsm8k/test.jsonl")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--resume-from", default=None, help="A step-* checkpoint directory.")
-    parser.add_argument("--algorithm", choices=sorted(ALGORITHM_SETTINGS), default="grpo")
+    parser.add_argument(
+        "--algorithm",
+        "--method",
+        dest="algorithm",
+        choices=sorted(ALGORITHM_SETTINGS),
+        default="grpo",
+    )
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--prompts-per-rollout", type=int, default=32)
     parser.add_argument("--group-size", type=int, default=8)
@@ -97,6 +117,18 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--advantage-eps", type=float, default=1e-6)
+    parser.add_argument(
+        "--kimi-tau",
+        type=float,
+        default=0.01,
+        help="Smoke-only OPMD coefficient; choose explicitly for formal experiments.",
+    )
+    parser.add_argument(
+        "--kimi-inner-epochs",
+        type=int,
+        default=2,
+        help="Smoke-only fixed-rollout inner updates per outer iteration.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--vllm-port", type=int, default=8000)
     parser.add_argument("--vllm-startup-timeout", type=int, default=900)
@@ -112,11 +144,11 @@ def make_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
-    parser.add_argument("--save-every", type=int, default=50, help="0 disables periodic checkpoints.")
+    parser.add_argument("--save-every", type=int, default=0, help="0 disables periodic checkpoints.")
     parser.add_argument(
         "--save-final",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     parser.add_argument(
         "--gradient-checkpointing",
@@ -161,6 +193,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("validation-request-batch-size must be positive.")
     if args.validation_rollouts_to_log < 0:
         raise ValueError("validation-rollouts-to-log cannot be negative.")
+    if args.algorithm == "kimi_opmd" and args.kimi_tau <= 0:
+        raise ValueError("kimi-tau must be positive for kimi_opmd training.")
+    if args.kimi_inner_epochs <= 0:
+        raise ValueError("kimi-inner-epochs must be positive.")
 
 
 def load_gsm8k(path: Path) -> list[dict[str, str]]:
@@ -288,6 +324,186 @@ def init_wandb(args: argparse.Namespace):
     )
 
 
+def make_optimizer(
+    policy: torch.nn.Module,
+    args: argparse.Namespace,
+) -> torch.optim.Optimizer:
+    return torch.optim.AdamW(
+        policy.parameters(),
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.weight_decay,
+        fused=True,
+    )
+
+
+def compute_reference_log_probs(
+    policy: torch.nn.Module,
+    tokenized: dict[str, torch.Tensor],
+    microbatch_size: int,
+    device: str,
+) -> torch.Tensor:
+    """Cache frozen per-token log-probs under the current outer reference."""
+    chunks = []
+    with torch.no_grad():
+        for start in range(0, tokenized["input_ids"].shape[0], microbatch_size):
+            end = start + microbatch_size
+            output = run_get_response_log_probs(
+                policy,
+                tokenized["input_ids"][start:end].to(device),
+                tokenized["labels"][start:end].to(device),
+                return_token_entropy=False,
+            )
+            chunks.append(output["log_probs"].detach().cpu())
+    return torch.cat(chunks, dim=0)
+
+
+def run_kimi_outer_update(
+    policy: torch.nn.Module,
+    tokenizer: Any,
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    repeated_prompts: list[str],
+    responses: list[str],
+    repeated_ground_truths: list[str],
+    outer_step: int,
+    metrics_path: Path,
+) -> tuple[torch.optim.Optimizer, torch.Tensor, dict[str, Any]]:
+    """Run one frozen-reference Kimi outer iteration and its inner updates."""
+    batch_size = len(responses)
+    microbatch_size = batch_size // args.gradient_accumulation_steps
+    device = str(next(policy.parameters()).device)
+    tokenized = run_tokenize_prompt_and_output(repeated_prompts, responses, tokenizer)
+    response_lengths = tokenized["response_mask"].sum(dim=1).float()
+    raw_rewards, reward_metadata = run_compute_rollout_rewards(
+        r1_zero_reward_fn,
+        responses,
+        repeated_ground_truths,
+    )
+    advantages = compute_group_mean_advantages(raw_rewards, args.group_size).detach()
+
+    grouped_advantage_sums = advantages.reshape(-1, args.group_size).sum(dim=1)
+    if not torch.allclose(
+        grouped_advantage_sums,
+        torch.zeros_like(grouped_advantage_sums),
+        atol=1e-6,
+        rtol=0.0,
+    ):
+        raise RuntimeError("Kimi group-mean advantages do not sum to zero.")
+
+    previous_training_mode = policy.training
+    policy.eval()
+    try:
+        reference_log_probs = compute_reference_log_probs(
+            policy,
+            tokenized,
+            microbatch_size,
+            device,
+        )
+        if reference_log_probs.requires_grad:
+            raise RuntimeError("Kimi reference log-probs must be detached.")
+
+        if optimizer.state:
+            raise RuntimeError("Fresh Kimi optimizer unexpectedly contains state.")
+        outer_event = {
+            "split": "kimi_outer",
+            "step": outer_step,
+            "kimi/tau": args.kimi_tau,
+            "kimi/inner_epochs": args.kimi_inner_epochs,
+            "kimi/reference_refreshed": 1,
+            "kimi/optimizer_reset": 1,
+            "kimi/optimizer_state_entries_before": 0,
+        }
+        append_jsonl(metrics_path, outer_event)
+        print(json.dumps(outer_event), flush=True)
+
+        final_loss = torch.zeros((), device=device)
+        final_inner_metrics: dict[str, Any] = {}
+        for inner_step in range(1, args.kimi_inner_epochs + 1):
+            optimizer.zero_grad(set_to_none=True)
+            total_loss = torch.zeros((), device=device)
+            diagnostic_totals: dict[str, float] = {}
+
+            for start in range(0, batch_size, microbatch_size):
+                end = start + microbatch_size
+                input_ids = tokenized["input_ids"][start:end].to(device)
+                labels = tokenized["labels"][start:end].to(device)
+                response_mask = tokenized["response_mask"][start:end].to(device)
+                policy_output = run_get_response_log_probs(
+                    policy,
+                    input_ids,
+                    labels,
+                    return_token_entropy=False,
+                )
+                microbatch_loss, diagnostics = compute_kimi_opmd_loss(
+                    policy_output["log_probs"],
+                    reference_log_probs[start:end].to(device),
+                    response_mask,
+                    advantages[start:end].to(device),
+                    tau=args.kimi_tau,
+                )
+                microbatch_weight = (end - start) / batch_size
+                scaled_loss = microbatch_loss * microbatch_weight
+                scaled_loss.backward()
+                total_loss += scaled_loss.detach()
+                for key, value in diagnostics.items():
+                    diagnostic_totals[key] = diagnostic_totals.get(key, 0.0) + (
+                        float(value.cpu()) * microbatch_weight
+                    )
+
+            if not torch.isfinite(total_loss):
+                raise FloatingPointError("Kimi loss became non-finite.")
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                policy.parameters(),
+                args.max_grad_norm,
+            )
+            if not torch.isfinite(grad_norm):
+                raise FloatingPointError("Kimi gradient norm became non-finite.")
+            optimizer.step()
+
+            inner_metrics: dict[str, Any] = {
+                "split": "kimi_inner",
+                "step": outer_step,
+                "kimi/inner_step": inner_step,
+                "kimi/tau": args.kimi_tau,
+                "loss": float(total_loss.cpu()),
+                "grad_norm": float(grad_norm.cpu()),
+                "kimi/response_length_mean": float(response_lengths.mean()),
+                "kimi/response_length_min": float(response_lengths.min()),
+                "kimi/response_length_max": float(response_lengths.max()),
+                "kimi/nonfinite": 0,
+                "kimi/optimizer_state_entries_after": len(optimizer.state),
+                **diagnostic_totals,
+            }
+            append_jsonl(metrics_path, inner_metrics)
+            print(json.dumps(inner_metrics, ensure_ascii=False), flush=True)
+            final_loss = total_loss
+            final_inner_metrics = inner_metrics
+
+        outer_metadata: dict[str, Any] = {
+            **reward_metadata,
+            "advantage_mean": float(advantages.mean()),
+            "advantage_std": float(advantages.std()),
+            "reward_std": float(raw_rewards.std()),
+            "kimi/tau": args.kimi_tau,
+            "kimi/inner_epochs": args.kimi_inner_epochs,
+            "kimi/reference_requires_grad": int(reference_log_probs.requires_grad),
+            "kimi/group_advantage_sum_abs_max": float(grouped_advantage_sums.abs().max()),
+            "kimi/response_length_mean": float(response_lengths.mean()),
+            "kimi/response_length_min": float(response_lengths.min()),
+            "kimi/response_length_max": float(response_lengths.max()),
+            "kimi/nonfinite": 0,
+            **{
+                key: value
+                for key, value in final_inner_metrics.items()
+                if key.startswith("kimi/") or key == "grad_norm"
+            },
+        }
+        return optimizer, final_loss, outer_metadata
+    finally:
+        policy.train(previous_training_mode)
+
+
 def run_validation(
     server: VLLMServer,
     examples: list[dict[str, str]],
@@ -404,16 +620,10 @@ def main() -> int:
         )
     policy.train()
 
-    optimizer = torch.optim.AdamW(
-        policy.parameters(),
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.weight_decay,
-        fused=True,
-    )
-    restore_optimizer_and_rng(args.resume_from, optimizer)
-
     algorithm = ALGORITHM_SETTINGS[args.algorithm]
+    optimizer = make_optimizer(policy, args)
+    if args.algorithm != "kimi_opmd":
+        restore_optimizer_and_rng(args.resume_from, optimizer)
     rollout_batch_size = args.prompts_per_rollout * args.group_size
     normalization_constant = None
     if algorithm["loss_normalization"] == "constant":
@@ -456,6 +666,11 @@ def main() -> int:
         for step_index in range(start_step, args.steps):
             step = step_index + 1
             step_started = time.monotonic()
+            if args.algorithm == "kimi_opmd":
+                # Explicit outer-loop boundary: reset optimizer, then theta_i
+                # becomes the rollout/reference policy for this fixed batch.
+                optimizer = make_optimizer(policy, args)
+                server.sync_policy_weights(policy)
             selected = select_examples(
                 examples,
                 args.prompts_per_rollout,
@@ -496,24 +711,37 @@ def main() -> int:
             ]
             responses = [completion.text for completion in completions]
 
-            loss, metadata = run_grpo_train_step(
-                model=policy,
-                tokenizer=tokenizer,
-                optimizer=optimizer,
-                gradient_accumulation_steps=args.gradient_accumulation_steps,
-                max_grad_norm=args.max_grad_norm,
-                reward_fn=r1_zero_reward_fn,
-                repeated_prompts=repeated_prompts,
-                rollout_responses=responses,
-                repeated_ground_truths=repeated_ground_truths,
-                group_size=args.group_size,
-                baseline=algorithm["baseline"],
-                advantage_eps=args.advantage_eps,
-                advantage_normalizer=algorithm["advantage_normalizer"],
-                importance_reweighting_method="none",
-                loss_normalization=algorithm["loss_normalization"],
-                normalization_constant=normalization_constant,
-            )
+            if args.algorithm == "kimi_opmd":
+                optimizer, loss, metadata = run_kimi_outer_update(
+                    policy=policy,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    args=args,
+                    repeated_prompts=repeated_prompts,
+                    responses=responses,
+                    repeated_ground_truths=repeated_ground_truths,
+                    outer_step=step,
+                    metrics_path=metrics_path,
+                )
+            else:
+                loss, metadata = run_grpo_train_step(
+                    model=policy,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    max_grad_norm=args.max_grad_norm,
+                    reward_fn=r1_zero_reward_fn,
+                    repeated_prompts=repeated_prompts,
+                    rollout_responses=responses,
+                    repeated_ground_truths=repeated_ground_truths,
+                    group_size=args.group_size,
+                    baseline=algorithm["baseline"],
+                    advantage_eps=args.advantage_eps,
+                    advantage_normalizer=algorithm["advantage_normalizer"],
+                    importance_reweighting_method="none",
+                    loss_normalization=algorithm["loss_normalization"],
+                    normalization_constant=normalization_constant,
+                )
             server.sync_policy_weights(policy)
 
             metrics = scalar_metrics(metadata)
