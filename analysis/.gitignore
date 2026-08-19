@@ -1,0 +1,5 @@
+.vendor/
+reasoningforge-analysis.tgz
+experiments/**/run_config.json
+experiments/kimi-opmd-tau-summary.json
+experiments/kimi-opmd-tau-summary.csv

@@ -1,0 +1,62 @@
+{
+  "main_results": [
+    {
+      "method": "GRPO",
+      "final_validation_accuracy": 0.4951171875,
+      "best_validation_accuracy": 0.5048828125,
+      "last5_validation_mean": 0.490625,
+      "last20_train_reward_mean": 0.4986328125,
+      "final_format_rate": 0.94921875
+    },
+    {
+      "method": "Dr.GRPO",
+      "final_validation_accuracy": 0.458984375,
+      "best_validation_accuracy": 0.4794921875,
+      "last5_validation_mean": 0.4587890625,
+      "last20_train_reward_mean": 0.473828125,
+      "final_format_rate": 0.939453125
+    },
+    {
+      "method": "Kimi-OPMD",
+      "final_validation_accuracy": 0.5087890625,
+      "best_validation_accuracy": 0.513671875,
+      "last5_validation_mean": 0.498828125,
+      "last20_train_reward_mean": 0.5171875,
+      "final_format_rate": 0.9677734375
+    }
+  ],
+  "compute": {
+    "GRPO": {
+      "optimizer_updates": 200,
+      "recorded_train_hours": 1.1158912388870765
+    },
+    "Dr.GRPO": {
+      "optimizer_updates": 200,
+      "recorded_train_hours": 1.0356005168757596
+    },
+    "Kimi-OPMD": {
+      "optimizer_updates": 400,
+      "recorded_train_hours": 1.7140633468933002
+    }
+  },
+  "kimi_mechanism": {
+    "active_updates": 196,
+    "zero_force_updates": 4,
+    "force_ratio_mean": 0.5794214042215408,
+    "force_ratio_median": 0.5340956058019828,
+    "force_ratio_last50_mean": 0.5756730843370412,
+    "movement_last50_mean": 3.4189402470178902,
+    "preclip_grad_norm_median": 63.25,
+    "preclip_grad_norm_max": 772.0,
+    "clip_fraction": 1.0,
+    "nonfinite_count": 0,
+    "retokenized_length_over_512_steps": 87
+  },
+  "limitations": [
+    "All methods were run with one seed; no cross-seed uncertainty is available.",
+    "Tau sweeps contain 20 outer iterations and are diagnostic rather than final-accuracy comparisons.",
+    "Kimi uses two optimizer updates per outer iteration (400 total versus 200 for each baseline).",
+    "Kimi gradient norms are recorded before clipping at 1.0.",
+    "Response length is measured after training-side retokenization and may differ from vLLM token_ids length."
+  ]
+}
