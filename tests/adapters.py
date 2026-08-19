@@ -242,7 +242,7 @@ def run_compute_group_normalized_rewards(
     assert raw_rewards.numel() % group_size == 0
     grouped_rewards = raw_rewards.view(-1, group_size)
     grouped_mean = grouped_rewards.mean(dim=1, keepdim=True)
-    grouped_std = grouped_rewards.std(dim=1, keepdim=True,correction=0)
+    grouped_std = grouped_rewards.std(dim=1, keepdim=True, correction=1)
 
     if baseline == "mean":
         advantages = grouped_rewards - grouped_mean
@@ -612,10 +612,13 @@ def run_grpo_train_step(
             )
         )
 
-        scaled_loss = (
-            micro_loss
-            / gradient_accumulation_steps
-        )
+        if loss_normalization == "sequence":
+            scaled_loss = micro_loss / gradient_accumulation_steps
+        else:
+            # Constant normalization already divides each microbatch's summed
+            # token loss by the global normalization constant. Summing those
+            # microbatch losses reconstructs the full rollout-batch loss.
+            scaled_loss = micro_loss
 
         scaled_loss.backward()
 
