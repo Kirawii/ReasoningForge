@@ -79,18 +79,21 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-data", default="data/gsm8k/train.jsonl")
     parser.add_argument(
         "--prompt-template",
-        default="cs336_alignment/prompts/r1_zero_three_shot_gsm8k.prompt",
+        default="cs336_alignment/prompts/r1_zero.prompt",
     )
+    parser.add_argument("--validation-data", default="data/gsm8k/test.jsonl")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--resume-from", default=None, help="A step-* checkpoint directory.")
     parser.add_argument("--algorithm", choices=sorted(ALGORITHM_SETTINGS), default="grpo")
-    parser.add_argument("--steps", type=int, default=100)
-    parser.add_argument("--prompts-per-rollout", type=int, default=2)
-    parser.add_argument("--group-size", type=int, default=4)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--prompts-per-rollout", type=int, default=32)
+    parser.add_argument("--group-size", type=int, default=8)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=128)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--adam-beta1", type=float, default=0.9)
+    parser.add_argument("--adam-beta2", type=float, default=0.95)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--advantage-eps", type=float, default=1e-6)
@@ -99,6 +102,16 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vllm-startup-timeout", type=int, default=900)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.45)
     parser.add_argument("--rollout-request-batch-size", type=int, default=None)
+    parser.add_argument("--validation-every", type=int, default=10, help="0 disables validation.")
+    parser.add_argument("--validation-examples", type=int, default=1024)
+    parser.add_argument("--validation-temperature", type=float, default=0.0)
+    parser.add_argument("--validation-request-batch-size", type=int, default=32)
+    parser.add_argument("--validation-rollouts-to-log", type=int, default=8)
+    parser.add_argument(
+        "--eval-at-start",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--save-every", type=int, default=50, help="0 disables periodic checkpoints.")
     parser.add_argument(
         "--save-final",
@@ -134,10 +147,20 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.max_new_tokens <= 0:
         raise ValueError("max-new-tokens must be positive.")
+    if not 0.0 <= args.adam_beta1 < 1.0 or not 0.0 <= args.adam_beta2 < 1.0:
+        raise ValueError("Adam betas must be in [0, 1).")
     if not 0.0 < args.vllm_gpu_memory_utilization < 1.0:
         raise ValueError("vllm-gpu-memory-utilization must be between 0 and 1.")
     if args.save_every < 0:
         raise ValueError("save-every cannot be negative.")
+    if args.validation_every < 0:
+        raise ValueError("validation-every cannot be negative.")
+    if args.validation_examples <= 0:
+        raise ValueError("validation-examples must be positive.")
+    if args.validation_request_batch_size <= 0:
+        raise ValueError("validation-request-batch-size must be positive.")
+    if args.validation_rollouts_to_log < 0:
+        raise ValueError("validation-rollouts-to-log cannot be negative.")
 
 
 def load_gsm8k(path: Path) -> list[dict[str, str]]:
@@ -265,6 +288,82 @@ def init_wandb(args: argparse.Namespace):
     )
 
 
+def run_validation(
+    server: VLLMServer,
+    examples: list[dict[str, str]],
+    prompt_template: str,
+    args: argparse.Namespace,
+    step: int,
+    metrics_path: Path,
+    rollouts_path: Path,
+    wandb_run: Any,
+) -> dict[str, Any]:
+    """Evaluate the synchronized vLLM policy on a fixed GSM8K subset."""
+    count = min(args.validation_examples, len(examples))
+    selected = examples[:count]
+    prompts = [
+        prompt_template.format(question=example["question"])
+        for example in selected
+    ]
+    started = time.monotonic()
+    completions = server.generate_completions(
+        prompts=prompts,
+        sampling_params={
+            "temperature": args.validation_temperature,
+            "max_tokens": args.max_new_tokens,
+            "n": 1,
+            "seed": args.seed,
+            "stop": ["</answer>"],
+            "include_stop_str_in_output": True,
+        },
+        batch_size=args.validation_request_batch_size,
+    )
+    if len(completions) != count:
+        raise RuntimeError(
+            f"Validation returned {len(completions)} completions; expected {count}."
+        )
+
+    scores = [
+        r1_zero_reward_fn(completion.text, example["ground_truth"])
+        for completion, example in zip(completions, selected)
+    ]
+    metrics: dict[str, Any] = {
+        "split": "validation",
+        "step": step,
+        "reward_mean": sum(score["reward"] for score in scores) / count,
+        "format_reward_mean": sum(score["format_reward"] for score in scores) / count,
+        "answer_reward_mean": sum(score["answer_reward"] for score in scores) / count,
+        "examples": count,
+        "validation_seconds": time.monotonic() - started,
+    }
+    append_jsonl(metrics_path, metrics)
+
+    for index in range(min(args.validation_rollouts_to_log, count)):
+        append_jsonl(
+            rollouts_path,
+            {
+                "split": "validation",
+                "step": step,
+                "question": selected[index]["question"],
+                "ground_truth": selected[index]["ground_truth"],
+                "response": completions[index].text,
+                **scores[index],
+            },
+        )
+
+    if wandb_run is not None:
+        wandb_run.log(
+            {
+                f"validation/{key}": value
+                for key, value in metrics.items()
+                if key not in {"split", "step"}
+            },
+            step=step,
+        )
+    print(json.dumps(metrics, ensure_ascii=False), flush=True)
+    return metrics
+
+
 def main() -> int:
     args = make_parser().parse_args()
     validate_args(args)
@@ -284,6 +383,9 @@ def main() -> int:
     )
 
     examples = load_gsm8k(Path(args.train_data))
+    validation_examples = None
+    if args.validation_every or args.eval_at_start:
+        validation_examples = load_gsm8k(Path(args.validation_data))
     prompt_template = load_template(Path(args.prompt_template))
     model_source, start_step = checkpoint_source(args)
     if start_step >= args.steps:
@@ -305,6 +407,7 @@ def main() -> int:
     optimizer = torch.optim.AdamW(
         policy.parameters(),
         lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.weight_decay,
         fused=True,
     )
@@ -328,6 +431,7 @@ def main() -> int:
 
     metrics_path = output_dir / "metrics.jsonl"
     rollouts_path = output_dir / "rollouts.jsonl"
+    validation_rollouts_path = output_dir / "validation_rollouts.jsonl"
     last_saved_step = -1
     try:
         print(f"Starting vLLM on cuda:{vllm_gpu} ...", flush=True)
@@ -335,6 +439,19 @@ def main() -> int:
         print("Initializing NCCL weight synchronization ...", flush=True)
         server.init_weight_sync(policy_device)
         server.sync_policy_weights(policy)
+
+        if args.eval_at_start:
+            assert validation_examples is not None
+            run_validation(
+                server,
+                validation_examples,
+                prompt_template,
+                args,
+                start_step,
+                metrics_path,
+                validation_rollouts_path,
+                wandb_run,
+            )
 
         for step_index in range(start_step, args.steps):
             step = step_index + 1
@@ -402,6 +519,7 @@ def main() -> int:
             metrics = scalar_metrics(metadata)
             metrics.update(
                 {
+                    "split": "train",
                     "step": step,
                     "loss": float(loss.detach().cpu()),
                     "step_seconds": time.monotonic() - step_started,
@@ -412,6 +530,7 @@ def main() -> int:
             append_jsonl(
                 rollouts_path,
                 {
+                    "split": "train",
                     "step": step,
                     "question": selected[0]["question"],
                     "ground_truth": selected[0]["ground_truth"],
@@ -419,8 +538,28 @@ def main() -> int:
                 },
             )
             if wandb_run is not None:
-                wandb_run.log(metrics, step=step)
+                wandb_run.log(
+                    {
+                        f"train/{key}": value
+                        for key, value in metrics.items()
+                        if key not in {"split", "step"}
+                    },
+                    step=step,
+                )
             print(json.dumps(metrics, ensure_ascii=False), flush=True)
+
+            if args.validation_every and step % args.validation_every == 0:
+                assert validation_examples is not None
+                run_validation(
+                    server,
+                    validation_examples,
+                    prompt_template,
+                    args,
+                    step,
+                    metrics_path,
+                    validation_rollouts_path,
+                    wandb_run,
+                )
 
             if args.save_every and step % args.save_every == 0:
                 saved = save_checkpoint(
